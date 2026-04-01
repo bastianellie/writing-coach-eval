@@ -1,5 +1,6 @@
 dagshub==0.6.8
 datasets==4.0.0
+giskard[llm]==2.19.1
 fsspec==2024.10.0
 fuzzywuzzy==0.18.0
 huggingface_hub==1.4.1
