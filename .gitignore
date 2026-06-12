@@ -9,3 +9,7 @@
 mlflow.db
 /mlartifacts
 final_data/previous_wc_version
+.idea
+.DS_Store
+llm_outputs.txt
+llm_prompts.txt
