@@ -5,12 +5,33 @@ from __future__ import annotations
 import csv
 import json
 import os
+import sys
 import time
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from dotenv import load_dotenv
+
+
+def _raise_csv_field_limit() -> None:
+    """Raise the CSV per-field size limit so large `input` documents can be read.
+
+    Input rows can carry document text well beyond the default 128 KB field
+    limit. Use the largest value the platform's C long accepts, backing off on
+    OverflowError (sys.maxsize overflows the C long on some platforms).
+    """
+    max_int = sys.maxsize
+    while True:
+        try:
+            csv.field_size_limit(max_int)
+            return
+        except OverflowError:
+            max_int = int(max_int // 10)
+
+
+_raise_csv_field_limit()
 
 from src.scripts.writing_coach_interfaces import create_writing_coach
 from src.scripts.writing_coach_interfaces.utils import install_wc_app_path
@@ -35,18 +56,30 @@ def _load_environment() -> None:
         load_dotenv()
 
 
-def _already_processed(details_jsonl: Path) -> set:
-    """Return set of row_ids already written to the JSONL output file."""
+def _datapoint_key(query: Any, input_text: Any) -> tuple[str, str]:
+    """Content key identifying a datapoint: the (query, input) pair, stripped.
+
+    Used to diff input rows against already-processed output so resume is based
+    on content rather than positional row_id. (query, input) — not query alone —
+    because the same command/query is commonly reused across different inputs.
+    """
+    return (str(query or '').strip(), str(input_text or '').strip())
+
+
+def _already_processed_keys(details_jsonl: Path) -> set:
+    """Return the set of (query, input) keys already written to the JSONL output."""
     processed = set()
     if details_jsonl.exists():
         with open(details_jsonl, 'r', encoding='utf-8') as f:
             for line in f:
                 line = line.strip()
-                if line:
-                    try:
-                        processed.add(json.loads(line)['row_id'])
-                    except (json.JSONDecodeError, KeyError):
-                        pass
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                    processed.add(_datapoint_key(record.get('query'), record.get('input')))
+                except json.JSONDecodeError:
+                    pass
     return processed
 
 
@@ -156,6 +189,77 @@ def _ensure_results_csv_schema(results_csv: Path, details_jsonl: Path) -> None:
     tmp_path.replace(results_csv)
 
 
+def _compute_row_result(
+    coach,
+    row_id: int,
+    row: Dict[str, Any],
+    n_input_rows: int,
+    folder_source: str,
+    dataset_source: str,
+) -> Optional[Dict[str, Any]]:
+    """Run Writing Coach on a single row (with retries) and annotate provenance.
+
+    Returns the result dict, or None if the row is skipped (missing query/input).
+    Performs no I/O on the output files — safe to call from worker threads.
+    """
+    query = row.get('query', '').strip()
+    document_text = row.get('input', '').strip()
+    row_route_intended = (row.get('route_intended') or '').strip().upper()
+    row_metadata = row.get('metadata') or ''
+
+    if not query or not document_text:
+        print(f"Row {row_id}: SKIPPED (missing query or input)")
+        return None
+
+    print(f"\nRow {row_id}/{n_input_rows}: {query[:60]}...")
+
+    try:
+        result = coach.run_query(row_id, query, document_text)
+    except Exception as e:
+        if row_id == 1 and "orchestrator failed" in str(e):
+            # Retry first row once (cold start recovery)
+            time.sleep(2)
+            result = coach.run_query(row_id, query, document_text)
+        else:
+            print(f"  Row {row_id} ERROR (attempt 1): {e} — retrying in 10s...")
+            time.sleep(10)
+            try:
+                result = coach.run_query(row_id, query, document_text)
+                print(f"  Row {row_id} retry succeeded.")
+            except Exception as e2:
+                print(f"  Row {row_id} ERROR (attempt 2): {e2} — marking as ERROR.")
+                result = {
+                    'row_id': row_id,
+                    'query': query,
+                    'input_preview': document_text[:200],
+                    'input': document_text,
+                    'route': 'ERROR',
+                    'intent': 'error',
+                    'reasoning': str(e2),
+                    'response': '',
+                    'suggestions': [],
+                    'references': [],
+                    'research_papers': [],
+                    'segments_count': 0,
+                    'tools_used': [],
+                }
+
+    # Annotate with input-dataset provenance fields
+    result['folder_source'] = folder_source
+    result['dataset_source'] = dataset_source
+    result['route_intended'] = row_route_intended
+    result['metadata'] = row_metadata
+    return result
+
+
+def _persist_result(result: Dict[str, Any], csv_writer, csv_file, jsonl_file) -> None:
+    """Write a result to the CSV + JSONL outputs and flush (no progress is lost)."""
+    _write_csv_row(csv_writer, result)
+    csv_file.flush()
+    jsonl_file.write(json.dumps(result, ensure_ascii=False) + '\n')
+    jsonl_file.flush()
+
+
 def process_csv(
     input_csv: str,
     version: str = 'v3',
@@ -165,6 +269,7 @@ def process_csv(
     results_csv_override: Optional[str] = None,
     details_jsonl_override: Optional[str] = None,
     wc_app_src: Optional[str] = None,
+    workers: int = 1,
 ) -> None:
     """Process rows in CSV, writing results incrementally after each row.
 
@@ -177,9 +282,14 @@ def process_csv(
         filter_route: If set, only process rows whose 'route' column matches this value
                       (case-insensitive). Pass None to process all rows.
         limit: If set, only consider the first N selected rows after route filtering.
+        workers: Number of concurrent Writing Coach queries. 1 (default) keeps the
+                 sequential behaviour with inter-row rate-limit delays; >1 runs a
+                 thread pool with no delays (writes are serialised with a lock).
     """
     if limit is not None and limit < 0:
         raise ValueError('limit must be >= 0')
+    if workers < 1:
+        raise ValueError('workers must be >= 1')
 
     _load_environment()
     install_wc_app_path(wc_app_src or os.getenv('WC_APP_SRC'))
@@ -188,30 +298,33 @@ def process_csv(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # Fixed filenames based on input stem so resume works across restarts
-    # Allow caller to override output paths (e.g. to append into an existing file)
+    # Provenance fields still derive from the input file.
     stem = Path(input_csv).stem
     folder_source = Path(input_csv).resolve().parent.name
     dataset_source = stem
     route_suffix = f'_{filter_route.upper()}' if filter_route else ''
+
+    # Default output filenames embed the WC version and the month-day, e.g.
+    # final_results_v3_0612_results.csv. The date keeps runs from different days
+    # separate; note this means resume only kicks in for runs on the same day.
+    # Allow caller to override output paths (e.g. to append into an existing file).
+    base_name = f'final_results_{version}_{datetime.now().strftime("%m%d")}'
     if results_csv_override:
         results_csv = Path(results_csv_override)
         results_csv.parent.mkdir(parents=True, exist_ok=True)
     else:
-        results_csv = output_path / f'{stem}{route_suffix}_results.csv'
+        results_csv = output_path / f'{base_name}{route_suffix}_results.csv'
 
     if details_jsonl_override:
         details_jsonl = Path(details_jsonl_override)
         details_jsonl.parent.mkdir(parents=True, exist_ok=True)
     else:
-        details_jsonl = output_path / f'{stem}{route_suffix}_details.jsonl'
+        details_jsonl = output_path / f'{base_name}{route_suffix}_details.jsonl'
 
     _ensure_results_csv_schema(results_csv, details_jsonl)
 
-    # Resume: skip rows already in the JSONL output
-    processed_ids = _already_processed(details_jsonl)
-    if processed_ids:
-        print(f"Resuming — {len(processed_ids)} rows already processed, skipping them.")
+    # Resume via content diff: read the (query, input) keys already in the output.
+    processed_keys = _already_processed_keys(details_jsonl)
 
     with open(input_csv, 'r', encoding='utf-8-sig') as f:
         rows = list(csv.DictReader(f))
@@ -229,6 +342,20 @@ def process_csv(
     else:
         rows_to_run = [(i + 1, row) for i, row in enumerate(rows)]
         print(f"\n[{coach.version}] Processing all {len(rows)} rows from {input_csv}")
+
+    # Resume: run only the diff — input rows whose (query, input) is not already
+    # in the output. Robust to row reordering, unlike positional row_id matching.
+    if processed_keys:
+        before = len(rows_to_run)
+        rows_to_run = [
+            (row_id, row) for (row_id, row) in rows_to_run
+            if _datapoint_key(row.get('query'), row.get('input')) not in processed_keys
+        ]
+        print(
+            f"[{coach.version}] Resume diff: {len(processed_keys)} datapoint(s) already "
+            f"in output; skipping {before - len(rows_to_run)} of {before}, "
+            f"{len(rows_to_run)} new to run."
+        )
 
     if limit is not None:
         original_count = len(rows_to_run)
@@ -248,7 +375,7 @@ def process_csv(
     if csv_is_new:
         csv_writer.writeheader()
 
-    completed = len(processed_ids)
+    completed = 0
     total = len(rows_to_run)
 
     if total == 0:
@@ -270,80 +397,65 @@ def process_csv(
             print(f"  Dummy query failed (continuing anyway): {e}")
         print("=" * 80 + "\n")
 
+        def _progress(result: Dict[str, Any], done: int) -> None:
+            print(f"  Route: {result['route']} | Intent: {result['intent']} | "
+                  f"Papers: {len(result['research_papers'])} | "
+                  f"Response: {len(result['response'])} chars "
+                  f"[{done}/{total} done]")
+
         try:
-            for idx, (row_id, row) in enumerate(rows_to_run):
-                if row_id in processed_ids:
-                    print(f"Row {row_id}: SKIPPED (already processed)")
-                    continue
+            if workers > 1:
+                # Parallel mode: thread pool, no inter-row delays (worker count is
+                # the rate cap). Queries run concurrently but results are written in
+                # the original input order: completions are buffered and the
+                # contiguous prefix is flushed as soon as it is ready, so output
+                # order matches input and partial progress is still saved on crash.
+                from concurrent.futures import ThreadPoolExecutor, as_completed
 
-                query         = row.get('query', '').strip()
-                document_text = row.get('input', '').strip()
-                row_route_intended = (row.get('route_intended') or '').strip().upper()
-                row_metadata       = row.get('metadata') or ''
+                print(f"[{coach.version}] Parallel mode: {workers} workers "
+                      f"(inter-row delay disabled, output kept in input order)")
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    future_to_idx = {
+                        executor.submit(
+                            _compute_row_result, coach, row_id, row,
+                            len(rows), folder_source, dataset_source,
+                        ): idx
+                        for idx, (row_id, row) in enumerate(rows_to_run)
+                    }
+                    pending: Dict[int, Optional[Dict[str, Any]]] = {}
+                    next_idx = 0
+                    for future in as_completed(future_to_idx):
+                        pending[future_to_idx[future]] = future.result()
+                        # Flush every contiguous-from-next_idx result, in order.
+                        while next_idx in pending:
+                            result = pending.pop(next_idx)
+                            next_idx += 1
+                            if result is None:
+                                continue
+                            _persist_result(result, csv_writer, csv_file, jsonl_file)
+                            completed += 1
+                            _progress(result, completed)
+            else:
+                # Sequential mode: keep the rate-limit delays between rows.
+                for idx, (row_id, row) in enumerate(rows_to_run):
+                    result = _compute_row_result(
+                        coach, row_id, row, len(rows), folder_source, dataset_source,
+                    )
+                    if result is None:
+                        continue
 
-                if not query or not document_text:
-                    print(f"Row {row_id}: SKIPPED (missing query or input)")
-                    continue
+                    _persist_result(result, csv_writer, csv_file, jsonl_file)
+                    completed += 1
+                    _progress(result, completed)
 
-                print(f"\nRow {row_id}/{len(rows)} (#{idx + 1} of {total} to run): {query[:60]}...")
+                    if idx == 0:  # First row just completed
+                        print("  Warming up connections for 5s...")
+                        time.sleep(5)
 
-                try:
-                    result = coach.run_query(row_id, query, document_text)
-                except Exception as e:
-                    if row_id == 1 and "orchestrator failed" in str(e):
-                        # Retry first row once (cold start recovery)
-                        time.sleep(2)
-                        result = coach.run_query(row_id, query, document_text)
-                    else:
-                        print(f"  ERROR (attempt 1): {e} — retrying in 10s...")
-                        time.sleep(10)
-                        try:
-                            result = coach.run_query(row_id, query, document_text)
-                            print("  Retry succeeded.")
-                        except Exception as e2:
-                            print(f"  ERROR (attempt 2): {e2} — marking as ERROR.")
-                            result = {
-                                'row_id': row_id,
-                                'query': query,
-                                'input_preview': document_text[:200],
-                                'input': document_text,
-                                'route': 'ERROR',
-                                'intent': 'error',
-                                'reasoning': str(e2),
-                                'response': '',
-                                'suggestions': [],
-                                'references': [],
-                                'research_papers': [],
-                                'segments_count': 0,
-                                'tools_used': [],
-                            }
-
-                # Annotate with input-dataset provenance fields
-                result['folder_source']   = folder_source
-                result['dataset_source']  = dataset_source
-                result['route_intended']  = row_route_intended
-                result['metadata']        = row_metadata
-
-                # Write immediately — flush to disk so no progress is lost on crash
-                _write_csv_row(csv_writer, result)
-                csv_file.flush()
-                jsonl_file.write(json.dumps(result, ensure_ascii=False) + '\n')
-                jsonl_file.flush()
-
-                completed += 1
-                print(f"  Route: {result['route']} | Intent: {result['intent']} | "
-                      f"Papers: {len(result['research_papers'])} | "
-                      f"Response: {len(result['response'])} chars "
-                      f"[{completed}/{total} done]")
-
-                if idx == 0:  # First row just completed
-                    print("  Warming up connections for 5s...")
-                    time.sleep(5)
-
-                # Delay between rows to avoid HTTP 429 rate limit errors
-                if idx < total - 1:
-                    print(f"  Waiting {ROW_DELAY_SECONDS}s before next row...")
-                    time.sleep(ROW_DELAY_SECONDS)
+                    # Delay between rows to avoid HTTP 429 rate limit errors
+                    if idx < total - 1:
+                        print(f"  Waiting {ROW_DELAY_SECONDS}s before next row...")
+                        time.sleep(ROW_DELAY_SECONDS)
 
         finally:
             csv_file.close()
@@ -416,6 +528,9 @@ if __name__ == "__main__":
                         help='Override output JSONL path (useful for appending into an existing file)')
     parser.add_argument('--wc-app-src', default=(os.getenv('WC_APP_SRC') or '').strip('"').strip("'") or None,
                         dest='wc_app_src', help='Path to Writing Coach app root (optional if WC_APP_SRC is set)')
+    parser.add_argument('--workers', type=int, default=1,
+                        help='Number of concurrent queries (default: 1 = sequential with '
+                             'inter-row delays). >1 enables a thread pool with no delays.')
 
     args = parser.parse_args()
 
@@ -428,4 +543,5 @@ if __name__ == "__main__":
         results_csv_override=args.results_csv,
         details_jsonl_override=args.details_jsonl,
         wc_app_src=args.wc_app_src,
+        workers=args.workers,
     )
