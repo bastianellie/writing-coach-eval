@@ -13,3 +13,5 @@ final_data/previous_wc_version
 .DS_Store
 llm_outputs.txt
 llm_prompts.txt
+/.vscode
+/.vscode/*
