@@ -122,11 +122,17 @@ The older `reassign_data.py` uses hardcoded per-row exceptions and is kept for r
 
 ## Stage 2 — Run Evaluation: `run_full_eval.py`
 
-`src/run_full_eval.py` orchestrates the full evaluation pipeline end-to-end. It always runs the five row-level evaluation/reporting steps below, and can also run optional Giskard dataset-level scans in the same output folder when requested via `--metrics`.
+`src/run_full_eval.py` orchestrates the full evaluation pipeline end-to-end. By default it runs **all** metrics: the five row-level evaluation/reporting steps below **and** the Giskard dataset-level scans, all in the same output folder. Use `--metrics` to restrict to a subset.
 
 ```bash
 python -m src.run_full_eval
 ```
+
+> **Note:** Because Giskard scans run by default, `WC_APP_SRC` must be set (or `--wc-app-src` passed) for a default run, and default runs are slower (they generate adversarial samples and run scan suites). For a fast, scoring-only run, pass the row-level metrics explicitly:
+>
+> ```bash
+> python -m src.run_full_eval --metrics completeness output_relevancy correctness
+> ```
 
 Key options:
 
@@ -135,20 +141,38 @@ Key options:
 | `--input` | `final_data/all_results.csv` | Input CSV with system outputs |
 | `--route-column` | `intended` | `intended` or `orchestrator` |
 | `--routes` | (all) | Restrict to specific routes, e.g. `RESEARCH RESPOND` |
-| `--metrics` | (all row-level) | Restrict to specific metrics. Row-level: `completeness output_relevancy correctness`. Optional Giskard scans: `potential_harm toxicity resilience` |
+| `--metrics` | **all metrics** | Restrict to specific metrics. Row-level: `completeness output_relevancy correctness`. Giskard scans: `potential_harm toxicity resilience`. Groundedness: `groundedness` |
+| `--rubrics-mode` | `combined` | `combined` (one prompt for all metrics) or `split` (one prompt per metric); controls the `one_prompt` / `multi_prompt` output segment |
 | `--run-name` | `eval_YYYYMMDD_HHMMSS` | Namespace for output files |
 | `--limit` | — | Max rows to process (useful for testing) |
-| `--n-samples` | `20` | Seed sample size for requested Giskard scans |
+| `--output-root` | `eval_data` | Base directory under which the run folder is created |
+| `--wc-version` | `v3` | Writing Coach interface version (`v2` or `v3`); sets the `wc<version>` output segment |
+| `--wc-app-src` | `$WC_APP_SRC` | Path to the Writing Coach app root (required when Giskard scans run) |
+| `--n-samples` | `20` | Seed sample size for Giskard scans |
 | `--seed` | `42` | Random seed for Giskard sampling / adversarial generation |
 | `--n-adversarial-samples` | `5` | Adversarial samples per Giskard detector |
 | `--n-requirements` | `4` | Requirements generated per Giskard detector |
+| `--hd-method` | `trustcard` | Hallucination-detection method for the `groundedness` metric |
+| `--hd-model` | `gpt-5-mini` | Azure deployment used by the HD detector |
+| `--hd-prompt-version` | `V5_anchor_V7` | HD detection prompt version |
 
 Examples:
 
 ```bash
-python -m src.run_full_eval --metrics completeness output_relevancy
+# Default: all metrics, including Giskard scans (requires WC_APP_SRC)
+python -m src.run_full_eval
+
+# Row-level scoring only (fast, no Giskard / groundedness)
+python -m src.run_full_eval --metrics completeness output_relevancy correctness
+
+# Giskard scans only
 python -m src.run_full_eval --metrics potential_harm toxicity resilience
-python -m src.run_full_eval --metrics completeness correctness potential_harm
+
+# Groundedness (hallucination detection) only
+python -m src.run_full_eval --metrics groundedness
+
+# Mixed subset
+python -m src.run_full_eval --metrics completeness correctness groundedness
 ```
 
 ### Output location
@@ -156,8 +180,10 @@ python -m src.run_full_eval --metrics completeness correctness potential_harm
 All outputs land under:
 
 ```
-eval_data/wcv2_one_prompt/{route_intended|route_orch}/{timestamp}/
+{output-root}/wc{version}_{one|multi}_prompt/{route_intended|route_orch}/{timestamp}/
 ```
+
+The path segments are derived from the run options: `{output-root}` from `--output-root` (default `eval_data`), `wc{version}` from `--wc-version` (default `v3`), `{one|multi}_prompt` from `--rubrics-mode` (`combined` → `one_prompt`, `split` → `multi_prompt`), and the route folder from `--route-column`. A default run therefore lands under `eval_data/wcv3_one_prompt/route_intended/{timestamp}/`.
 
 Key files produced:
 
@@ -168,15 +194,31 @@ Key files produced:
 | `*_all_results_enriched.csv/jsonl` | Eval columns merged back onto original rows |
 | `scores_all_natural_synthetic.txt` | Printed score summary for all / natural / synthetic splits |
 | `heuristic_scoring_all_natural_synthetic.txt` | Heuristic scoring summary |
-| `summary_scores.csv` | Flat summary keyed by `data_origin` × `scope` × `route` |
+| `summary_scores.csv` | Flat summary keyed by `data_origin` × `scope` × `route` (includes `scope="groundedness"` rows when groundedness runs) |
 | `metrics_score_combinations/item_level/reasoning_summaries.json` | LLM-generated pattern summaries per metric and score |
-| `{potential_harm|toxicity|resilience}/...` | Optional Giskard HTML/JSON/test-suite artifacts for requested scan metrics |
+| `{potential_harm|toxicity|resilience}/...` | Giskard HTML/JSON/test-suite artifacts for each scan metric that ran (all three by default) |
+| `groundedness.json` | Full per-summary HD results (claims, decisions, reasoning) + aggregate |
+| `groundedness_summary.csv` | One row per scored summary plus an `OVERALL` aggregate row |
 
 ### Steps and scripts called internally
 
-#### Optional pre-step — Giskard dataset scans
+#### Pre-step — Giskard dataset scans
 
-When `--metrics` includes any of `potential_harm`, `toxicity`, or `resilience`, `run_full_eval.py` first runs the matching detector-specific Giskard scan wrappers and writes the generated report artifacts into metric-specific subdirectories under the timestamped run folder. If only scan metrics are selected, the command exits after this stage.
+By default `--metrics` includes `potential_harm`, `toxicity`, and `resilience`, so `run_full_eval.py` first runs the matching detector-specific Giskard scan wrappers and writes the generated report artifacts into metric-specific subdirectories under the timestamped run folder. Restrict `--metrics` to row-level metrics only to skip this stage; if only scan metrics are selected, the command exits after this stage.
+
+#### Pre-step — Groundedness (hallucination detection)
+
+When `--metrics` includes `groundedness` (in the default set), `run_full_eval.py` runs hallucination detection over every row whose **orchestrator** route (`route_orch`) is `RESEARCH` or `REVISE_RESEARCH`:
+
+1. **Decompose** the row into "summaries" — the `response` (RESEARCH) or each suggestion's `transformed_text` (REVISE_RESEARCH) — each paired with the structured references it cites.
+2. **Extract claims** with a rule (a *claim* is the smallest text span ending at a citation tag) and pair each claim with the abstract/snippet of its cited references.
+3. **Classify** each claim/reference pair as `Entailment` / `Contradiction` / `Unverifiable` via the `--hd-model` Azure deployment, producing a per-summary distribution:
+   ```json
+   "claim_distribution_per_summary": { "entailment(%)": 90.0, "unverifiable(%)": 10.0, "contradiction(%)": 0.0 }
+   ```
+4. **Aggregate** into a grounded ratio: a summary is *grounded* when `entailment(%) + 0.87 * unverifiable(%) >= 85`; the grounded ratio is the fraction of grounded summaries.
+
+The HD method is swappable behind the `HallucinationDetector` interface in `src/evaluation/hallucination/`; select one with `--hd-method` (currently: `trustcard`). The detector uses this repo's Azure config (`AZURE_OPENAI_*`). Outputs: `groundedness.json`, `groundedness_summary.csv`, and `scope="groundedness"` rows in `summary_scores.csv`. If only `groundedness` (and/or scan metrics) are selected, the command exits after this stage.
 
 #### Step 1 — `src/evaluation/eval_pipeline.py`
 
