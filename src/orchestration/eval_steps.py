@@ -11,6 +11,7 @@ def step_eval_pipeline(
     run_name: str | None,
     metrics: list[str] | None = None,
     limit: int | None = None,
+    rubrics_mode: str = "combined",
 ) -> None:
     """Run the LLM rubrics evaluation pipeline."""
     import asyncio
@@ -26,7 +27,32 @@ def step_eval_pipeline(
             save_local=True,
             metrics=metrics,
             limit=limit,
+            rubrics_mode=rubrics_mode,
         )
+    )
+
+
+def step_groundedness(
+    input_path: str,
+    output_dir: Path,
+    hd_method: str,
+    model: str,
+    prompt_version: str,
+    limit: int | None = None,
+) -> tuple[dict, str]:
+    """Run hallucination detection (groundedness) over RESEARCH / REVISE_RESEARCH rows.
+
+    Returns (summary_dict, printable_table).
+    """
+    from src.evaluation.hallucination import get_detector
+    from src.evaluation.groundedness import run_groundedness
+
+    detector = get_detector(hd_method, model=model, prompt_version=prompt_version)
+    return run_groundedness(
+        input_path=input_path,
+        detector=detector,
+        output_dir=output_dir,
+        limit=limit,
     )
 
 

@@ -1,7 +1,11 @@
-"""Giskard scan orchestration and metric routing."""
+"""Giskard scan orchestration and metric routing.
 
+Metric name lists and the ``split_selected_metrics`` router live in
+``src.constants.metrics_definitions`` (the single source of truth). This module
+only owns the mapping from scan-metric names to their scan runner functions.
+"""
 
-SCORING_METRIC_NAMES: list[str] = ["completeness", "output_relevancy", "correctness"]
+from src.constants.metrics_definitions import SCAN_METRIC_NAMES
 
 
 def _run_harmfulness_scan(*args, **kwargs):
@@ -27,30 +31,10 @@ SCAN_METRIC_RUNNERS = {
     "toxicity": _run_stereotypes_scan,
     "resilience": _run_jailbreak_scan,
 }
-ALL_METRIC_NAMES: list[str] = [*SCORING_METRIC_NAMES, *SCAN_METRIC_RUNNERS.keys()]
 
-
-def split_selected_metrics(metrics: list[str] | None) -> tuple[list[str] | None, list[str]]:
-    """Split selected metrics into row-scoring metrics and Giskard scan metrics.
-
-    Args:
-        metrics: List of metric names, or None to select all row-level metrics.
-
-    Returns:
-        Tuple of (scoring_metrics, scan_metrics) where scoring_metrics is None
-        if all row-level metrics are selected, or a list of the selected ones.
-        scan_metrics is always a list (possibly empty).
-    """
-    if metrics is None:
-        return None, []
-
-    normalized: list[str] = []
-    for metric in metrics:
-        value = metric.lower().replace(" ", "_")
-        if value not in normalized:
-            normalized.append(value)
-
-    scoring = [metric for metric in normalized if metric in SCORING_METRIC_NAMES]
-    scans = [metric for metric in normalized if metric in SCAN_METRIC_RUNNERS]
-    return scoring, scans
+# Keep the runner mapping aligned with the canonical scan-metric registry.
+assert set(SCAN_METRIC_RUNNERS) == set(SCAN_METRIC_NAMES), (
+    "SCAN_METRIC_RUNNERS keys must match SCAN_METRIC_NAMES "
+    f"({sorted(SCAN_METRIC_RUNNERS)} != {sorted(SCAN_METRIC_NAMES)})"
+)
 

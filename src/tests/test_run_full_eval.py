@@ -3,23 +3,25 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from src.evaluation.giskard_orchestrator import split_selected_metrics
+from src.constants.metrics_definitions import split_selected_metrics
 from src.orchestration.eval_steps import step_giskard_scans
 
 
 class TestSelectedMetricsSplit(unittest.TestCase):
 
     def test_none_defaults_to_scoring_pipeline_only(self):
-        scoring, scans = split_selected_metrics(None)
+        scoring, scans, groundedness = split_selected_metrics(None)
         self.assertIsNone(scoring)
         self.assertEqual(scans, [])
+        self.assertEqual(groundedness, [])
 
     def test_mixed_metrics_are_normalized_and_partitioned(self):
-        scoring, scans = split_selected_metrics(
-            ["Completeness", "potential harm", "correctness", "resilience", "correctness"]
+        scoring, scans, groundedness = split_selected_metrics(
+            ["Completeness", "potential harm", "correctness", "resilience", "correctness", "groundedness"]
         )
         self.assertEqual(scoring, ["completeness", "correctness"])
         self.assertEqual(scans, ["potential_harm", "resilience"])
+        self.assertEqual(groundedness, ["groundedness"])
 
 
 class TestGiskardScanStep(unittest.TestCase):

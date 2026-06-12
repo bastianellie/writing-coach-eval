@@ -37,7 +37,11 @@ from src.evaluation.prompt_loader import (
     build_judge_prompts,
     format_metrics_definition,
 )
-from src.constants.metrics_definitions import CORRECTNESS_METRIC_NAME, METRICS_DEFINITION
+from src.constants.metrics_definitions import (
+    CORRECTNESS_METRIC_NAME,
+    METRICS_DEFINITION,
+    SCORING_METRIC_NAMES,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -95,8 +99,8 @@ SCORE_FIELD_LABELS = {
 # Short keys used to DRY metric loops in stats/summary code
 METRIC_KEYS = ("output_relevancy", "completeness", "correctness")
 
-# Canonical metric names accepted by the --metrics CLI argument
-SCORING_METRIC_NAMES: list[str] = ["completeness", "output_relevancy", "correctness"]
+# SCORING_METRIC_NAMES is imported from src.constants.metrics_definitions
+# (single source of truth) and used by the --metrics CLI argument below.
 
 NON_RESPONSE_STATUS = "NO_RESPONSE"
 

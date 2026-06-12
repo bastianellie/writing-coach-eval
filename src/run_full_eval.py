@@ -2,6 +2,7 @@
 
 Orchestrates these scripts in order:
   Optional: Giskard scans      — dataset-level safety / robustness scans
+  Optional: groundedness       — hallucination detection over RESEARCH / REVISE_RESEARCH
   1. eval_pipeline.py          — LLM rubrics evaluation
   2. split_natural_synthetic.py — split enriched results by data origin
   3. heuristic_scoring.py       — heuristic scoring for all / natural / synthetic
@@ -29,12 +30,27 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from src.evaluation.giskard_orchestrator import ALL_METRIC_NAMES, split_selected_metrics
+# Load environment (AZURE_OPENAI_*, WC_APP_SRC, ...) from the repo-root .env up
+# front, so it is available regardless of which metric step runs. Some step
+# modules also call load_dotenv() on import, but those imports are lazy — e.g. a
+# groundedness-only run never imports them, so the orchestrator must load it.
+from dotenv import load_dotenv
+
+load_dotenv(_REPO_ROOT / ".env")
+
+from src.constants.metrics_definitions import ALL_METRIC_NAMES, split_selected_metrics
+from src.evaluation.giskard_summary import (
+    build_giskard_summary_rows,
+    format_giskard_summary_table,
+    write_giskard_summary_csv,
+)
+from src.evaluation.hallucination import DEFAULT_HD_METHOD, available_detectors
 from src.evaluation.summary_scores import SUMMARY_CSV_FIELDNAMES, build_summary_csv_rows, write_summary_csv
 from src.orchestration.eval_steps import (
     step_eval_pipeline,
     step_extract_reasoning,
     step_giskard_scans,
+    step_groundedness,
     step_heuristic_scoring,
     step_split_natural_synthetic,
     step_summarize_reasoning,
@@ -70,6 +86,17 @@ def parse_args() -> argparse.Namespace:
         help="Only evaluate rows with these routes (e.g. RESEARCH RESPOND)",
     )
     parser.add_argument(
+        "--rubrics-mode",
+        choices=["combined", "split"],
+        default="combined",
+        help=(
+            "How to run the rubrics generator. "
+            "'combined' (default): single LLM call with all metrics in one prompt "
+            "(output folder uses 'one_prompt'). "
+            "'split': one LLM call per metric (output folder uses 'multi_prompt')."
+        ),
+    )
+    parser.add_argument(
         "--run-name",
         default=None,
         help="Name for output files (default: eval_YYYYMMDD_HHMMSS)",
@@ -78,11 +105,12 @@ def parse_args() -> argparse.Namespace:
         "--metrics",
         "--metric",
         nargs="+",
-        default=None,
+        default=list(ALL_METRIC_NAMES),
         choices=ALL_METRIC_NAMES,
         metavar="METRIC",
         help=(
-            "Subset of metrics to evaluate (default: all). "
+            "Subset of metrics to evaluate (default: all metrics, including "
+            "Giskard scans). "
             "Row-level metrics: completeness, output_relevancy, correctness. "
             "Giskard scan metrics: potential_harm, toxicity, resilience. "
             "Example: --metrics completeness output_relevancy potential_harm"
@@ -93,6 +121,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Max number of rows to process (for testing)",
+    )
+    parser.add_argument(
+        "--output-root",
+        default="eval_data",
+        help=(
+            "Base directory under which the run's root folder is created "
+            "(default: eval_data). The full path is "
+            "<output-root>/wc<version>_<one|multi>_prompt/<route_folder>/<timestamp>/."
+        ),
     )
     parser.add_argument(
         "--n-samples",
@@ -132,24 +169,50 @@ def parse_args() -> argparse.Namespace:
             "(optional if WC_APP_SRC is set)"
         ),
     )
+    parser.add_argument(
+        "--hd-method",
+        default=DEFAULT_HD_METHOD,
+        choices=available_detectors(),
+        help=(
+            "Hallucination-detection method for the 'groundedness' metric "
+            f"(default: {DEFAULT_HD_METHOD})"
+        ),
+    )
+    parser.add_argument(
+        "--hd-model",
+        default="gpt-5-mini",
+        help="Azure deployment used by the HD detector (default: gpt-5-mini)",
+    )
+    parser.add_argument(
+        "--hd-prompt-version",
+        default="V5_anchor_V7",
+        help="HD detection prompt version (default: V5_anchor_V7)",
+    )
     return parser.parse_args()
 
 
 
 def main() -> None:
     args = parse_args()
-    scoring_metrics, scan_metrics = split_selected_metrics(args.metrics)
+    scoring_metrics, scan_metrics, groundedness_metrics = split_selected_metrics(args.metrics)
     should_run_scoring_pipeline = args.metrics is None or bool(scoring_metrics)
-    total_steps = (1 if scan_metrics else 0) + (5 if should_run_scoring_pipeline else 0)
+    run_groundedness = bool(groundedness_metrics)
+    total_steps = (
+        (1 if scan_metrics else 0)
+        + (1 if run_groundedness else 0)
+        + (5 if should_run_scoring_pipeline else 0)
+    )
 
     route_folder = "route_orch" if args.route_column == "orchestrator" else "route_intended"
+    prompt_segment = "one_prompt" if args.rubrics_mode == "combined" else "multi_prompt"
     ts = timestamp()
-    base_output_dir = Path("eval_data/wcv2_one_prompt") / route_folder / ts
+    base_output_dir = Path(args.output_root) / f"wc{args.wc_version}_{prompt_segment}" / route_folder / ts
     base_output_dir.mkdir(parents=True, exist_ok=True)
     step_index = 0
 
     print(f"Selected row-level metrics: {scoring_metrics if scoring_metrics is not None else 'all'}")
     print(f"Selected Giskard scan metrics: {scan_metrics if scan_metrics else 'none'}")
+    print(f"Groundedness (HD): {'yes' if run_groundedness else 'no'}")
 
     if scan_metrics:
         step_index += 1
@@ -168,10 +231,44 @@ def main() -> None:
             wc_app_src=args.wc_app_src,
         )
 
+        # ---- Giskard scan summary (CSV + on-screen table) ----
+        giskard_rows = build_giskard_summary_rows(base_output_dir, scan_metrics)
+        giskard_summary_csv = base_output_dir / "giskard_scan_summary.csv"
+        write_giskard_summary_csv(giskard_summary_csv, giskard_rows)
+        print("\nGiskard scan summary:")
+        print(format_giskard_summary_table(giskard_rows))
+        print(f"\nSaved Giskard summary -> {giskard_summary_csv}")
+
+    groundedness_summary: dict | None = None
+    if run_groundedness:
+        step_index += 1
+        print("\n" + "=" * 80)
+        print(f"STEP {step_index}/{total_steps}  groundedness  ->  {base_output_dir}")
+        print("=" * 80)
+        groundedness_summary, gnd_table = step_groundedness(
+            input_path=args.input,
+            output_dir=base_output_dir,
+            hd_method=args.hd_method,
+            model=args.hd_model,
+            prompt_version=args.hd_prompt_version,
+            limit=args.limit,
+        )
+        print("\nGroundedness summary:")
+        print(gnd_table)
+        print(f"\nSaved groundedness -> {base_output_dir / 'groundedness_summary.csv'}")
+
     if not should_run_scoring_pipeline:
+        # No rubrics scoring — still emit a consolidated summary CSV if groundedness ran.
+        if groundedness_summary is not None:
+            summary_csv_path = base_output_dir / "summary_scores.csv"
+            write_summary_csv(
+                summary_csv_path,
+                build_summary_csv_rows(groundedness_summary=groundedness_summary),
+            )
+            print(f"Saved summary CSV -> {summary_csv_path}")
         print("\n" + "=" * 80)
         print("FULL PIPELINE COMPLETE")
-        print("Completed Giskard scans only (no row-level scoring metrics selected).")
+        print("Completed scan / groundedness metrics only (no row-level scoring metrics selected).")
         print(f"All outputs in: {base_output_dir}")
         print("=" * 80)
         return
@@ -189,6 +286,7 @@ def main() -> None:
         run_name=args.run_name,
         metrics=scoring_metrics,
         limit=args.limit,
+        rubrics_mode=args.rubrics_mode,
     )
 
     # Discover enriched CSV produced by step 1
@@ -250,7 +348,7 @@ def main() -> None:
 
     # ---- Build consolidated summary CSV ----
     summary_csv_path = base_output_dir / "summary_scores.csv"
-    csv_rows = build_summary_csv_rows(summaries, heuristic_summaries)
+    csv_rows = build_summary_csv_rows(summaries, heuristic_summaries, groundedness_summary)
     write_summary_csv(summary_csv_path, csv_rows)
     print(f"Saved summary CSV -> {summary_csv_path}")
 

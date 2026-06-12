@@ -39,6 +39,15 @@ SUMMARY_CSV_FIELDNAMES = [
         for metric_key, _ in _METRICS
         for stat_name in _HEURISTIC_STAT_FIELDS
     ],
+    # Groundedness (hallucination detection) — populated only on scope="groundedness" rows.
+    "grounded_ratio_pct",
+    "n_grounded",
+    "n_non_grounded",
+    "n_summaries",
+    "n_cited_claims",
+    "entailment_count",
+    "unverifiable_count",
+    "contradiction_count",
 ]
 
 
@@ -49,11 +58,43 @@ def nan_to_none(v: object) -> object:
     return v
 
 
+def build_groundedness_rows(groundedness_summary: dict) -> list[dict]:
+    """Build consolidated CSV rows from a groundedness aggregate.
+
+    Emits one row per route (from ``by_route``) plus an ``OVERALL`` row, all with
+    ``scope="groundedness"`` and ``data_origin="all"``. Reads the dict shape
+    produced by :func:`src.evaluation.groundedness.aggregate`.
+    """
+
+    def _row(route: str, agg: dict) -> dict:
+        lc = agg.get("label_counts", {})
+        return {
+            "data_origin": "all",
+            "scope": "groundedness",
+            "route": route,
+            "grounded_ratio_pct": agg.get("grounded_ratio(%)"),
+            "n_grounded": agg.get("grounded"),
+            "n_non_grounded": agg.get("non_grounded"),
+            "n_summaries": agg.get("total_summaries"),
+            "n_cited_claims": agg.get("total_cited_claims"),
+            "entailment_count": lc.get("Entailment"),
+            "unverifiable_count": lc.get("Unverifiable"),
+            "contradiction_count": lc.get("Contradiction"),
+        }
+
+    rows: list[dict] = []
+    for route, agg in (groundedness_summary.get("by_route") or {}).items():
+        rows.append(_row(route, agg))
+    rows.append(_row("OVERALL", groundedness_summary))
+    return rows
+
+
 def build_summary_csv_rows(
-    summaries: dict[str, dict],
-    heuristic_summaries: dict[str, dict],
+    summaries: dict[str, dict] | None = None,
+    heuristic_summaries: dict[str, dict] | None = None,
+    groundedness_summary: dict | None = None,
 ) -> list[dict]:
-    """Build flat CSV rows from LLM (split) summaries and heuristic summaries.
+    """Build flat CSV rows from LLM (split) summaries, heuristic summaries, and groundedness.
 
     *summaries* maps data_origin -> summarize_subset() result dict:
         {name, rows, ok_rows, status_counts, route_counts,
@@ -62,8 +103,14 @@ def build_summary_csv_rows(
     *heuristic_summaries* maps data_origin -> analyze_rows() summary dict:
         {rows_total, rows_scored, metrics: {metric_name: {...}}}
 
+    *groundedness_summary* is the aggregate produced by
+    :func:`src.evaluation.groundedness.aggregate` (optional).
+
     Returns a list of flat dicts, one per (data_origin, scope, route) combination.
+    Any of the inputs may be omitted; only the corresponding rows are emitted.
     """
+    summaries = summaries or {}
+    heuristic_summaries = heuristic_summaries or {}
     rows: list[dict] = []
 
     def _empty_metric_fields(prefix: str, stat_names: tuple[str, ...]) -> dict[str, None]:
@@ -113,7 +160,7 @@ def build_summary_csv_rows(
             )
         return values
 
-    for origin in ("all", "natural", "synthetic"):
+    for origin in ("all", "natural", "synthetic") if summaries else ():
         subset = summaries.get(origin, {})
         heuristic = heuristic_summaries.get(origin, {})
 
@@ -174,6 +221,9 @@ def build_summary_csv_rows(
             **_empty_metric_fields("heuristic", _HEURISTIC_STAT_FIELDS),
         }
         rows.append(macro_row)
+
+    if groundedness_summary:
+        rows.extend(build_groundedness_rows(groundedness_summary))
 
     return rows
 
