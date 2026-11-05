@@ -12,6 +12,7 @@ def step_eval_pipeline(
     metrics: list[str] | None = None,
     limit: int | None = None,
     rubrics_mode: str = "combined",
+    workers: int = 5,
 ) -> None:
     """Run the LLM rubrics evaluation pipeline."""
     import asyncio
@@ -28,6 +29,7 @@ def step_eval_pipeline(
             metrics=metrics,
             limit=limit,
             rubrics_mode=rubrics_mode,
+            concurrency=workers,
         )
     )
 
@@ -39,6 +41,7 @@ def step_groundedness(
     model: str,
     prompt_version: str,
     limit: int | None = None,
+    workers: int = 5,
 ) -> tuple[dict, str]:
     """Run hallucination detection (groundedness) over RESEARCH / REVISE_RESEARCH rows.
 
@@ -53,6 +56,7 @@ def step_groundedness(
         detector=detector,
         output_dir=output_dir,
         limit=limit,
+        workers=workers,
     )
 
 
@@ -66,8 +70,13 @@ def step_giskard_scans(
     n_requirements: int = 4,
     wc_version: str = "v3",
     wc_app_src: str | None = None,
+    workers: int = 1,
 ) -> None:
-    """Run the selected dataset-level Giskard scans."""
+    """Run the selected dataset-level Giskard scans.
+
+    Scans run sequentially; *workers* parallelizes the model predict batch
+    within each scan.
+    """
     from src.evaluation.giskard_orchestrator import SCAN_METRIC_RUNNERS
 
     for metric_name in scan_metrics:
@@ -84,6 +93,7 @@ def step_giskard_scans(
             wc_app_src=wc_app_src,
             persist_output=True,
             output_dir=str(metric_output_dir),
+            workers=workers,
         )
         print(f"Completed Giskard scan '{metric_name}'")
 

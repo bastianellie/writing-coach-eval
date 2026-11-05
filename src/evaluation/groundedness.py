@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import csv
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import jsonlines
@@ -110,32 +111,68 @@ def evaluate_groundedness(
     input_path: str | Path,
     detector: HallucinationDetector,
     limit: int | None = None,
+    workers: int = 1,
 ) -> list[dict]:
-    """Score every qualifying summary. Returns one result dict per summary."""
-    input_path = Path(input_path)
-    results: list[dict] = []
+    """Score every qualifying summary. Returns one result dict per summary.
 
-    for input_line, row in tqdm(_iter_rows(input_path), desc="Groundedness", unit="row"):
+    Summary units are scored concurrently with a pool of *workers* threads
+    (``score_summary`` is a blocking, network-bound call). Results preserve
+    input order regardless of completion order.
+    """
+    input_path = Path(input_path)
+
+    # Flatten rows into ordered candidate summary units (one entry per
+    # (text, references) pair) before scoring, so they can be dispatched to
+    # the thread pool.
+    candidates: list[dict] = []
+    for input_line, row in _iter_rows(input_path):
         route = str(row.get("route_orch", ""))
         for text, references in decompose_row(row):
-            score: SummaryScore = detector.score_summary(text, references)
+            candidates.append(
+                {
+                    "input_line": input_line,
+                    "route": route,
+                    "query": row.get("query", ""),
+                    "text": text,
+                    "references": references,
+                }
+            )
+
+    # `limit` is a testing aid: cap the number of summary units scored. Each
+    # candidate normally yields one result (decompose_row already drops units
+    # without references), so this closely matches the previous "first N
+    # summaries" behaviour while avoiding scoring the entire dataset.
+    if limit is not None:
+        candidates = candidates[:limit]
+
+    def _score(candidate: dict) -> SummaryScore:
+        return detector.score_summary(candidate["text"], candidate["references"])
+
+    results: list[dict] = []
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+        # executor.map preserves submission order, so results stay deterministic.
+        scores = executor.map(_score, candidates)
+        for candidate, score in tqdm(
+            zip(candidates, scores),
+            total=len(candidates),
+            desc="Groundedness",
+            unit="summary",
+        ):
             if score.n_cited_claims == 0:
                 continue  # no cited claims -> nothing to ground
             distribution = score.claim_distribution_per_summary
             results.append(
                 {
-                    "input_line": input_line,
-                    "route": route,
-                    "query": row.get("query", ""),
-                    "summary": text,
+                    "input_line": candidate["input_line"],
+                    "route": candidate["route"],
+                    "query": candidate["query"],
+                    "summary": candidate["text"],
                     "# cited claims": score.n_cited_claims,
                     "claim_distribution_per_summary": distribution,
                     "grounded": is_grounded(distribution),
                     "claims": score.claims,
                 }
             )
-        if limit is not None and len(results) >= limit:
-            break
 
     return results
 
@@ -256,12 +293,13 @@ def run_groundedness(
     detector: HallucinationDetector,
     output_dir: str | Path,
     limit: int | None = None,
+    workers: int = 1,
 ) -> tuple[dict, str]:
     """Full groundedness step: evaluate, aggregate, write JSON + CSV, return (summary, table)."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    results = evaluate_groundedness(input_path, detector, limit=limit)
+    results = evaluate_groundedness(input_path, detector, limit=limit, workers=workers)
     summary = aggregate(results)
 
     # Full results JSON

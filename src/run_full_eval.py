@@ -99,7 +99,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--run-name",
         default=None,
-        help="Name for output files (default: eval_YYYYMMDD_HHMMSS)",
+        help=(
+            "Run name, used both as the output sub-directory "
+            "(<output-root>/<run-name>) and the prefix for eval output files. "
+            "Default: eval_YYYYMMDD_HHMMSS"
+        ),
     )
     parser.add_argument(
         "--metrics",
@@ -123,12 +127,29 @@ def parse_args() -> argparse.Namespace:
         help="Max number of rows to process (for testing)",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=5,
+        help=(
+            "Number of parallel workers used by parallelizable steps: "
+            "rubrics-eval LLM concurrency, groundedness HD scoring, and the "
+            "Giskard predict batch within each scan. Default: 5."
+        ),
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help=(
+            "Stream Writing Coach / LeapSpace app logs and stdout to the console. "
+            "By default they are routed to <run_dir>/wc_app.log to keep the screen clean."
+        ),
+    )
+    parser.add_argument(
         "--output-root",
         default="eval_data",
         help=(
             "Base directory under which the run's root folder is created "
-            "(default: eval_data). The full path is "
-            "<output-root>/wc<version>_<one|multi>_prompt/<route_folder>/<timestamp>/."
+            "(default: eval_data). The full path is <output-root>/<run-name>/."
         ),
     )
     parser.add_argument(
@@ -203,10 +224,10 @@ def main() -> None:
         + (5 if should_run_scoring_pipeline else 0)
     )
 
-    route_folder = "route_orch" if args.route_column == "orchestrator" else "route_intended"
-    prompt_segment = "one_prompt" if args.rubrics_mode == "combined" else "multi_prompt"
-    ts = timestamp()
-    base_output_dir = Path(args.output_root) / f"wc{args.wc_version}_{prompt_segment}" / route_folder / ts
+    # Output goes to <output-root>/<run-name>. Fall back to a timestamped name
+    # when --run-name is omitted so runs never collide.
+    run_name = args.run_name or f"eval_{timestamp()}"
+    base_output_dir = Path(args.output_root) / run_name
     base_output_dir.mkdir(parents=True, exist_ok=True)
     step_index = 0
 
@@ -219,6 +240,16 @@ def main() -> None:
         print("\n" + "=" * 80)
         print(f"STEP {step_index}/{total_steps}  giskard_scans  ->  {base_output_dir}")
         print("=" * 80)
+
+        # Route the Writing Coach / LeapSpace app's logs + stdout to a file in
+        # the run folder so they don't flood the screen (unless --verbose).
+        from src.evaluation.giskard_scans.common import set_wc_logging
+
+        wc_log_path = base_output_dir / "wc_app.log"
+        set_wc_logging(log_file=str(wc_log_path), verbose=args.verbose)
+        if not args.verbose:
+            print(f"Writing Coach / LeapSpace logs -> {wc_log_path}")
+
         step_giskard_scans(
             input_path=args.input,
             output_dir=base_output_dir,
@@ -229,6 +260,7 @@ def main() -> None:
             n_requirements=args.n_requirements,
             wc_version=args.wc_version,
             wc_app_src=args.wc_app_src,
+            workers=args.workers,
         )
 
         # ---- Giskard scan summary (CSV + on-screen table) ----
@@ -252,6 +284,7 @@ def main() -> None:
             model=args.hd_model,
             prompt_version=args.hd_prompt_version,
             limit=args.limit,
+            workers=args.workers,
         )
         print("\nGroundedness summary:")
         print(gnd_table)
@@ -283,10 +316,11 @@ def main() -> None:
         output_dir=str(base_output_dir),
         route_column=args.route_column,
         routes=args.routes,
-        run_name=args.run_name,
+        run_name=run_name,
         metrics=scoring_metrics,
         limit=args.limit,
         rubrics_mode=args.rubrics_mode,
+        workers=args.workers,
     )
 
     # Discover enriched CSV produced by step 1

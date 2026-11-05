@@ -29,6 +29,7 @@ from collections import Counter  # noqa: E402
 
 import pandas as pd
 from dotenv import load_dotenv
+from tqdm import tqdm
 from langchain_openai import AzureChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 
@@ -1248,21 +1249,31 @@ async def run_pipeline(
     # Set up concurrency control
     semaphore = asyncio.Semaphore(concurrency)
 
-    # Create tasks for all rows
-    async def process_and_write(row: dict) -> dict:
-        result = await process_row(
-            row, deployment, temperature, max_tokens, semaphore,
-            rubrics_mode=rubrics_mode,
-            metrics=metrics,
-        )
-        await writer.write_result(result)
-        return result
-
     logger.info("Processing %d rows with concurrency=%d...", len(rows), concurrency)
     start_time = time.time()
 
+    # Progress bar over completed queries (advances as each row finishes,
+    # regardless of completion order; counts failures too via finally).
+    pbar = tqdm(total=len(rows), desc="Evaluating", unit="query")
+
+    # Create tasks for all rows
+    async def process_and_write(row: dict) -> dict:
+        try:
+            result = await process_row(
+                row, deployment, temperature, max_tokens, semaphore,
+                rubrics_mode=rubrics_mode,
+                metrics=metrics,
+            )
+            await writer.write_result(result)
+            return result
+        finally:
+            pbar.update(1)
+
     tasks = [process_and_write(row) for row in rows]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    try:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        pbar.close()
 
     elapsed = time.time() - start_time
 

@@ -23,6 +23,7 @@ def run_stereotypes_scan(
     model_type: SupportedModelTypes = "text_generation",
     persist_output: bool = False,
     output_dir: Optional[str] = None,
+    workers: int = 1,
 ) -> ScanReport:
     """Run stereotypes detector scan and return results.
 
@@ -54,6 +55,7 @@ def run_stereotypes_scan(
         model_type=model_type,
         persist_output=persist_output,
         output_dir=output_dir,
+        workers=workers,
     )
 
 

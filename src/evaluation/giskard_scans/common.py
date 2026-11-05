@@ -6,6 +6,9 @@ import inspect
 import json
 import logging
 import os
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -40,6 +43,101 @@ _DEFAULT_DATASET_CSV = Path(__file__).parents[3] / "final_data" / "all_results.c
 _wc_coach = None
 _wc_version: str | None = None
 
+# Thread-pool size for the model predict batch (see _writing_coach_predict_real).
+# Giskard owns the predict call, so the worker count is passed via this module
+# global, set by run_scan_for_detector before each scan.
+_predict_workers: int = 1
+
+
+def set_predict_workers(workers: int) -> None:
+	"""Set the number of threads used to score the predict batch in parallel."""
+	global _predict_workers  # noqa: PLW0603
+	_predict_workers = max(1, workers)
+
+
+# ---------------------------------------------------------------------------
+# Writing Coach / LeapSpace log routing
+#
+# The external WC app (loaded from WC_APP_SRC) attaches its own console logging
+# handlers (via basicConfig deep inside) and emits a lot of bare print() output
+# when it runs the real model. Both flood the screen during Giskard scans. These
+# helpers route the app's logs to a file and capture its stdout, so only the
+# eval pipeline's own output stays on screen. Adapted from src/scripts/store_output.py.
+# ---------------------------------------------------------------------------
+
+_wc_log_file: str = os.getenv("WC_LOG_FILE", "wc_app.log")
+_wc_log_verbose: bool = False
+
+
+def set_wc_logging(log_file: Optional[str] = None, verbose: bool = False) -> None:
+	"""Configure where Writing Coach / LeapSpace logs go.
+
+	Call before the first scan. *log_file* overrides the default destination;
+	*verbose* keeps the app's INFO logs and stdout on the console as well.
+	"""
+	global _wc_log_file, _wc_log_verbose  # noqa: PLW0603
+	if log_file:
+		_wc_log_file = log_file
+	_wc_log_verbose = verbose
+
+
+def _route_wc_logs_to_file() -> None:
+	"""Send the app's (and root) logs to the log file; keep console quiet.
+
+	Strips the console handlers the WC app attaches to the root logger so its
+	INFO logs stop printing on screen, routes INFO+ to ``_wc_log_file``, and
+	leaves only ERROR (or everything, when verbose) on the console. Must run
+	*after* the app has been imported (i.e. after create_writing_coach) so the
+	handlers it added are removed and this configuration wins.
+	"""
+	file_handler = logging.FileHandler(_wc_log_file, mode="a", encoding="utf-8")
+	file_handler.setLevel(logging.INFO)
+	file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+	file_handler._wc_log_managed = True
+
+	console_handler = logging.StreamHandler(sys.stderr)
+	console_handler.setLevel(logging.INFO if _wc_log_verbose else logging.ERROR)
+	console_handler.setFormatter(logging.Formatter("%(message)s"))
+	console_handler._wc_log_managed = True
+
+	root = logging.getLogger()
+	root.setLevel(logging.INFO)
+	for handler in list(root.handlers):
+		# Drop the app's console handlers (StreamHandler to stdout/stderr) so its
+		# INFO logs stop flooding the screen; keep FileHandlers. Also drop our
+		# own handlers from a previous call so re-running is idempotent.
+		is_console = (
+			isinstance(handler, logging.StreamHandler)
+			and not isinstance(handler, logging.FileHandler)
+		)
+		if is_console or getattr(handler, "_wc_log_managed", False):
+			handler.close()
+			root.removeHandler(handler)
+	root.addHandler(file_handler)
+	root.addHandler(console_handler)
+	logger.info("Writing Coach / LeapSpace logs routed to %s (verbose=%s)", _wc_log_file, _wc_log_verbose)
+
+
+@contextmanager
+def _redirect_stdout_to_log():
+	"""Redirect bare print() output to the log file while active.
+
+	The WC app emits progress via print() (bypassing logging). Redirecting
+	stdout to the log file captures it; stderr (tqdm bars, error logs) is left
+	alone. A no-op in verbose mode so prints stay on screen.
+	"""
+	if _wc_log_verbose:
+		yield
+		return
+	sink = open(_wc_log_file, "a", encoding="utf-8", buffering=1)
+	original_stdout = sys.stdout
+	sys.stdout = sink
+	try:
+		yield
+	finally:
+		sys.stdout = original_stdout
+		sink.close()
+
 
 def _get_wc_app_src() -> Optional[str]:
 	return os.getenv("WC_APP_SRC")
@@ -66,6 +164,10 @@ def init_wc_interface(version: str = "v3", wc_app_src: Optional[str] = None) -> 
 	logger.info("Initializing Writing Coach interface '%s' from %s", version, resolved_wc_app_src)
 	_wc_coach = create_writing_coach(version)
 	_wc_version = version
+
+	# Strip the console handlers the app just attached and route its logs to a
+	# file (must run after create_writing_coach so our configuration wins).
+	_route_wc_logs_to_file()
 
 
 def load_sample_documents(
@@ -106,27 +208,39 @@ def writing_coach_predict(df) -> list[str]:
 	return _writing_coach_predict_real(df)
 
 
+def _predict_single(idx: int, row) -> str:
+	"""Run one Writing Coach query and render its response (one predict-batch item)."""
+	try:
+		result = _wc_coach.run_query(
+			row_id=idx,
+			query=row["user_command"],
+			document_text=row["document"],
+		)
+		return build_response(result)
+	except openai.BadRequestError as exc:
+		return json.dumps(exc.body)
+	except Exception as exc:  # noqa: BLE001
+		logger.exception("Writing Coach prediction failed for scan row %s", idx)
+		return json.dumps({"error": str(exc)})
+
+
 def _writing_coach_predict_real(df) -> list[str]:
 	if _wc_coach is None:
 		raise RuntimeError("Writing Coach interface has not been initialized")
 
-	responses: list[str] = []
+	rows = [row for _, row in df.iterrows()]
 
-	for idx, (_, row) in enumerate(df.iterrows()):
-		try:
-			result = _wc_coach.run_query(
-				row_id=idx,
-				query=row["user_command"],
-				document_text=row["document"],
-			)
-			responses.append(build_response(result))
-		except openai.BadRequestError as exc:
-			responses.append(json.dumps(exc.body))
-		except Exception as exc:  # noqa: BLE001
-			logger.exception("Writing Coach prediction failed for scan row %s", idx)
-			responses.append(json.dumps({"error": str(exc)}))
+	# Sequential path keeps behaviour identical when no parallelism is requested.
+	if _predict_workers <= 1 or len(rows) <= 1:
+		return [_predict_single(idx, row) for idx, row in enumerate(rows)]
 
-	return responses
+	# Parallel path: score the predict batch with a thread pool. executor.map
+	# preserves input order, so responses stay aligned with the dataset rows.
+	# NOTE: this assumes _wc_coach.run_query is safe to call concurrently
+	# (the coach lives in the external WC app at WC_APP_SRC).
+	workers = min(_predict_workers, len(rows))
+	with ThreadPoolExecutor(max_workers=workers) as executor:
+		return list(executor.map(lambda item: _predict_single(*item), enumerate(rows)))
 
 
 def build_response(state: dict) -> str:
@@ -217,6 +331,7 @@ def run_scan_for_detector(
     model_type: SupportedModelTypes = "text_generation",
     persist_output: bool = False,
     output_dir: Optional[str] = None,
+    workers: int = 1,
 ) -> ScanReport:
     """Run scan for a single detector and optionally persist results.
 
@@ -232,11 +347,13 @@ def run_scan_for_detector(
         model_type: Giskard model type.
         persist_output: Whether to save results to disk.
         output_dir: Directory to save results (required if persist_output=True).
+        workers: Threads used to score the model predict batch in parallel.
 
     Returns:
         ScanReport object from the Giskard scan.
     """
     configure_giskard_llm_client()
+    set_predict_workers(workers)
 
     logger.info("Building Giskard model wrapper")
     gsk_model = build_giskard_model(model_type=model_type)
@@ -254,13 +371,16 @@ def run_scan_for_detector(
     logger.info("Running detector: %s", detector)
     detector_params = build_detector_params(detector, n_adversarial_samples, n_requirements)
 
-    scan_results: ScanReport = scan(
-        gsk_model,
-        gsk_dataset,
-        only=[detector],
-        raise_exceptions=False,
-        params=detector_params,
-    )
+    # Capture the WC app's bare print() flood (emitted while it runs the model
+    # during the scan) to the log file instead of the screen.
+    with _redirect_stdout_to_log():
+        scan_results: ScanReport = scan(
+            gsk_model,
+            gsk_dataset,
+            only=[detector],
+            raise_exceptions=False,
+            params=detector_params,
+        )
 
     if persist_output:
         if output_dir is None:
