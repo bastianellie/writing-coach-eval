@@ -29,6 +29,10 @@ def main() -> None:
                         help='Override output JSONL path (useful for appending into an existing file)')
     parser.add_argument('--wc-app-src', default=(os.getenv('WC_APP_SRC') or '').strip('"').strip("'") or None,
                         dest='wc_app_src', help='Path to Writing Coach app root (optional if WC_APP_SRC is set)')
+    parser.add_argument('--max-retries-no-suggestions', type=int, default=0,
+                        dest='max_retries_no_suggestions',
+                        help='Re-run a query up to N times when WC returns no suggestions '
+                             '(likely a misclassification). 0 disables retries (default: 0).')
     args = parser.parse_args()
 
     process_csv(
@@ -39,6 +43,7 @@ def main() -> None:
         results_csv_override=args.results_csv,
         details_jsonl_override=args.details_jsonl,
         wc_app_src=args.wc_app_src,
+        max_retries_no_suggestions=args.max_retries_no_suggestions,
     )
 
 

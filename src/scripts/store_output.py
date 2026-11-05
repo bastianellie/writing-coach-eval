@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import csv
 import json
+import logging
 import os
 import sys
 import time
@@ -13,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from dotenv import load_dotenv
+from tqdm import tqdm
 
 
 def _raise_csv_field_limit() -> None:
@@ -35,6 +38,96 @@ _raise_csv_field_limit()
 
 from src.scripts.writing_coach_interfaces import create_writing_coach
 from src.scripts.writing_coach_interfaces.utils import install_wc_app_path
+
+
+logger = logging.getLogger('store_output')
+
+DEFAULT_LOG_FILE = 'store_output.log'
+
+
+class _TqdmLoggingHandler(logging.Handler):
+    """Console handler that writes via tqdm.write so logs don't break the bar.
+
+    Writes to stderr (not stdout) so error logs stay on screen even while stdout
+    is redirected to the log file (see :func:`_redirect_stdout_to_log`).
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            tqdm.write(self.format(record), file=sys.stderr)
+        except Exception:
+            self.handleError(record)
+
+
+def _setup_logging(verbose: bool, log_file: str = DEFAULT_LOG_FILE) -> None:
+    """Route all logging — this script's *and* the Writing Coach app's — to a file.
+
+    Configures the **root** logger so it also captures the app ("LeapSpace") logs,
+    which propagate to root via ``logging.basicConfig``/``StreamHandler`` set up
+    deep inside the app. All INFO+ records are appended to ``log_file``. By
+    default only errors reach the console (so the progress bar stays clean while
+    failures still surface); passing ``verbose=True`` streams everything to the
+    console as well.
+
+    Call this *after* the app has been imported/initialised (e.g. after
+    ``create_writing_coach``) so we strip the console handlers the app attaches
+    and our configuration wins. Any later ``basicConfig`` calls are then no-ops
+    because the root logger already has handlers.
+    """
+    file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(name)s %(message)s'))
+    file_handler._store_output_managed = True
+
+    console_handler = _TqdmLoggingHandler()
+    console_handler.setLevel(logging.INFO if verbose else logging.ERROR)
+    console_handler.setFormatter(logging.Formatter('%(message)s'))
+    console_handler._store_output_managed = True
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    for handler in list(root.handlers):
+        # Drop the app's console handlers (StreamHandler to stdout/stderr) so its
+        # INFO logs stop flooding the screen; keep FileHandlers (they hit disk,
+        # not the screen). Also drop our own handlers from a previous call.
+        is_console = (
+            isinstance(handler, logging.StreamHandler)
+            and not isinstance(handler, logging.FileHandler)
+        )
+        if is_console or getattr(handler, '_store_output_managed', False):
+            handler.close()
+            root.removeHandler(handler)
+    root.addHandler(file_handler)
+    root.addHandler(console_handler)
+
+    # Our script logger has no handlers of its own — it propagates to root.
+    logger.setLevel(logging.INFO)
+    logger.propagate = True
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+
+
+@contextlib.contextmanager
+def _redirect_stdout_to_log(log_file: str, enabled: bool):
+    """Redirect bare ``print()`` output (sys.stdout) to the log file.
+
+    The Writing Coach app emits a lot of progress via ``print()`` (e.g.
+    "Tool response: ..." in its tool utils), which bypasses ``logging`` and so
+    floods the screen. Redirecting stdout to the log file captures it. The tqdm
+    progress bar and error logs use stderr, so they stay on screen. When
+    ``enabled`` is False (verbose mode) this is a no-op and prints stay on screen.
+    """
+    if not enabled:
+        yield
+        return
+    sink = open(log_file, 'a', encoding='utf-8', buffering=1)
+    original_stdout = sys.stdout
+    sys.stdout = sink
+    try:
+        yield
+    finally:
+        sys.stdout = original_stdout
+        sink.close()
 
 
 CSV_FIELDNAMES = [
@@ -196,6 +289,7 @@ def _compute_row_result(
     n_input_rows: int,
     folder_source: str,
     dataset_source: str,
+    max_retries_no_suggestions: int = 0,
 ) -> Optional[Dict[str, Any]]:
     """Run Writing Coach on a single row (with retries) and annotate provenance.
 
@@ -208,10 +302,10 @@ def _compute_row_result(
     row_metadata = row.get('metadata') or ''
 
     if not query or not document_text:
-        print(f"Row {row_id}: SKIPPED (missing query or input)")
+        logger.info(f"Row {row_id}: SKIPPED (missing query or input)")
         return None
 
-    print(f"\nRow {row_id}/{n_input_rows}: {query[:60]}...")
+    logger.info(f"Row {row_id}/{n_input_rows}: {query[:60]}...")
 
     try:
         result = coach.run_query(row_id, query, document_text)
@@ -221,13 +315,13 @@ def _compute_row_result(
             time.sleep(2)
             result = coach.run_query(row_id, query, document_text)
         else:
-            print(f"  Row {row_id} ERROR (attempt 1): {e} — retrying in 10s...")
+            logger.error(f"  Row {row_id} ERROR (attempt 1): {e} — retrying in 10s...")
             time.sleep(10)
             try:
                 result = coach.run_query(row_id, query, document_text)
-                print(f"  Row {row_id} retry succeeded.")
+                logger.info(f"  Row {row_id} retry succeeded.")
             except Exception as e2:
-                print(f"  Row {row_id} ERROR (attempt 2): {e2} — marking as ERROR.")
+                logger.error(f"  Row {row_id} ERROR (attempt 2): {e2} — marking as ERROR.")
                 result = {
                     'row_id': row_id,
                     'query': query,
@@ -243,6 +337,28 @@ def _compute_row_result(
                     'segments_count': 0,
                     'tools_used': [],
                 }
+
+    # Retry when WC returned no suggestions — likely a misclassification, not a hard error.
+    if (max_retries_no_suggestions > 0
+            and not result.get('suggestions')
+            and result.get('route', '').upper() != 'ERROR'):
+        for attempt in range(1, max_retries_no_suggestions + 1):
+            logger.info(
+                f"  Row {row_id}: no suggestions (route: {result.get('route', '?')}), "
+                f"retry {attempt}/{max_retries_no_suggestions}..."
+            )
+            try:
+                result = coach.run_query(row_id, query, document_text)
+            except Exception as exc:
+                logger.error(f"  Row {row_id} no-suggestions retry {attempt} failed: {exc}")
+            if result.get('suggestions'):
+                logger.info(f"  Row {row_id}: suggestions found on retry {attempt}.")
+                break
+        if not result.get('suggestions'):
+            logger.info(
+                f"  Row {row_id}: no suggestions after {max_retries_no_suggestions} retries "
+                f"(route: {result.get('route', '?')})."
+            )
 
     # Annotate with input-dataset provenance fields
     result['folder_source'] = folder_source
@@ -270,6 +386,9 @@ def process_csv(
     details_jsonl_override: Optional[str] = None,
     wc_app_src: Optional[str] = None,
     workers: int = 1,
+    verbose: bool = False,
+    log_file: str = DEFAULT_LOG_FILE,
+    max_retries_no_suggestions: int = 0,
 ) -> None:
     """Process rows in CSV, writing results incrementally after each row.
 
@@ -285,6 +404,10 @@ def process_csv(
         workers: Number of concurrent Writing Coach queries. 1 (default) keeps the
                  sequential behaviour with inter-row rate-limit delays; >1 runs a
                  thread pool with no delays (writes are serialised with a lock).
+        verbose: If True, also stream INFO logs to the console. By default only
+                 errors reach the console and a progress bar tracks completion;
+                 all logs are written to ``log_file`` regardless.
+        log_file: Path to the log file that captures all INFO+ logs.
     """
     if limit is not None and limit < 0:
         raise ValueError('limit must be >= 0')
@@ -294,6 +417,9 @@ def process_csv(
     _load_environment()
     install_wc_app_path(wc_app_src or os.getenv('WC_APP_SRC'))
     coach = create_writing_coach(version)
+    # Configure logging *after* the app is imported so we strip the console
+    # handlers it attaches to the root logger and route everything to the file.
+    _setup_logging(verbose, log_file)
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -318,6 +444,13 @@ def process_csv(
     if details_jsonl_override:
         details_jsonl = Path(details_jsonl_override)
         details_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    elif results_csv_override:
+        # Derive the details JSONL from the overridden CSV (same path, .jsonl
+        # extension) so each run keeps its own resume ledger. Otherwise the
+        # JSONL would fall back to the shared default dir and a second run over
+        # the same dataset would skip every row as "already processed".
+        details_jsonl = results_csv.with_suffix('.jsonl')
+        details_jsonl.parent.mkdir(parents=True, exist_ok=True)
     else:
         details_jsonl = output_path / f'{base_name}{route_suffix}_details.jsonl'
 
@@ -335,13 +468,13 @@ def process_csv(
             (i + 1, row) for i, row in enumerate(rows)
             if row.get('route', '').strip().upper() == filter_route.upper()
         ]
-        print(
-            f"\n[{coach.version}] Route filter: '{filter_route.upper()}' — "
+        logger.info(
+            f"[{coach.version}] Route filter: '{filter_route.upper()}' — "
             f"{len(rows_to_run)} matching rows out of {len(rows)} total"
         )
     else:
         rows_to_run = [(i + 1, row) for i, row in enumerate(rows)]
-        print(f"\n[{coach.version}] Processing all {len(rows)} rows from {input_csv}")
+        logger.info(f"[{coach.version}] Processing all {len(rows)} rows from {input_csv}")
 
     # Resume: run only the diff — input rows whose (query, input) is not already
     # in the output. Robust to row reordering, unlike positional row_id matching.
@@ -351,7 +484,7 @@ def process_csv(
             (row_id, row) for (row_id, row) in rows_to_run
             if _datapoint_key(row.get('query'), row.get('input')) not in processed_keys
         ]
-        print(
+        logger.info(
             f"[{coach.version}] Resume diff: {len(processed_keys)} datapoint(s) already "
             f"in output; skipping {before - len(rows_to_run)} of {before}, "
             f"{len(rows_to_run)} new to run."
@@ -360,12 +493,12 @@ def process_csv(
     if limit is not None:
         original_count = len(rows_to_run)
         rows_to_run = rows_to_run[:limit]
-        print(
+        logger.info(
             f"[{coach.version}] Row limit: processing first {len(rows_to_run)} "
             f"of {original_count} selected rows"
         )
 
-    print("=" * 80)
+    logger.info("=" * 80)
 
     # Open output files in append mode so partial progress is never lost
     csv_is_new = not results_csv.exists() or results_csv.stat().st_size == 0
@@ -381,85 +514,95 @@ def process_csv(
     if total == 0:
         csv_file.close()
         jsonl_file.close()
-        print("\nNo rows selected for processing.")
+        logger.info("No rows selected for processing.")
     else:
-        # Warm up with dummy query to consume cold start (first row CONVERSATION fallback)
-        print("\n" + "=" * 80)
-        print(f"WARMUP [{coach.version.upper()}]: Running dummy query to initialize graph...")
-        try:
-            dummy_result = coach.run_query(
-                row_id=0,
-                query="What is machine learning?",
-                document_text="Machine learning is a subset of artificial intelligence that focuses on developing algorithms and statistical models that enable computer systems to improve their performance on tasks through experience, without being explicitly programmed."
-            )
-            print(f"  Dummy query completed - route: {dummy_result['route']}")
-        except Exception as e:
-            print(f"  Dummy query failed (continuing anyway): {e}")
-        print("=" * 80 + "\n")
+        # Redirect the app's bare print() output (sys.stdout) to the log file so
+        # it doesn't flood the screen; the progress bar and errors use stderr.
+        with _redirect_stdout_to_log(log_file, enabled=not verbose):
+            # Warm up with dummy query to consume cold start (first row CONVERSATION fallback)
+            logger.info("=" * 80)
+            logger.info(f"WARMUP [{coach.version.upper()}]: Running dummy query to initialize graph...")
+            try:
+                dummy_result = coach.run_query(
+                    row_id=0,
+                    query="What is machine learning?",
+                    document_text="Machine learning is a subset of artificial intelligence that focuses on developing algorithms and statistical models that enable computer systems to improve their performance on tasks through experience, without being explicitly programmed."
+                )
+                logger.info(f"  Dummy query completed - route: {dummy_result['route']}")
+            except Exception as e:
+                logger.warning(f"  Dummy query failed (continuing anyway): {e}")
+            logger.info("=" * 80)
 
-        def _progress(result: Dict[str, Any], done: int) -> None:
-            print(f"  Route: {result['route']} | Intent: {result['intent']} | "
-                  f"Papers: {len(result['research_papers'])} | "
-                  f"Response: {len(result['response'])} chars "
-                  f"[{done}/{total} done]")
+            # Progress bar (shown on screen by default; per-row detail goes to the log).
+            pbar = tqdm(total=total, desc=f"WC {coach.version}", unit="query", file=sys.stderr)
 
-        try:
-            if workers > 1:
-                # Parallel mode: thread pool, no inter-row delays (worker count is
-                # the rate cap). Queries run concurrently but results are written in
-                # the original input order: completions are buffered and the
-                # contiguous prefix is flushed as soon as it is ready, so output
-                # order matches input and partial progress is still saved on crash.
-                from concurrent.futures import ThreadPoolExecutor, as_completed
+            def _progress(result: Dict[str, Any], done: int) -> None:
+                pbar.update(1)
+                logger.info(f"  Route: {result['route']} | Intent: {result['intent']} | "
+                            f"Papers: {len(result['research_papers'])} | "
+                            f"Response: {len(result['response'])} chars "
+                            f"[{done}/{total} done]")
 
-                print(f"[{coach.version}] Parallel mode: {workers} workers "
-                      f"(inter-row delay disabled, output kept in input order)")
-                with ThreadPoolExecutor(max_workers=workers) as executor:
-                    future_to_idx = {
-                        executor.submit(
-                            _compute_row_result, coach, row_id, row,
-                            len(rows), folder_source, dataset_source,
-                        ): idx
-                        for idx, (row_id, row) in enumerate(rows_to_run)
-                    }
-                    pending: Dict[int, Optional[Dict[str, Any]]] = {}
-                    next_idx = 0
-                    for future in as_completed(future_to_idx):
-                        pending[future_to_idx[future]] = future.result()
-                        # Flush every contiguous-from-next_idx result, in order.
-                        while next_idx in pending:
-                            result = pending.pop(next_idx)
-                            next_idx += 1
-                            if result is None:
-                                continue
-                            _persist_result(result, csv_writer, csv_file, jsonl_file)
-                            completed += 1
-                            _progress(result, completed)
-            else:
-                # Sequential mode: keep the rate-limit delays between rows.
-                for idx, (row_id, row) in enumerate(rows_to_run):
-                    result = _compute_row_result(
-                        coach, row_id, row, len(rows), folder_source, dataset_source,
-                    )
-                    if result is None:
-                        continue
+            try:
+                if workers > 1:
+                    # Parallel mode: thread pool, no inter-row delays (worker count is
+                    # the rate cap). Queries run concurrently but results are written in
+                    # the original input order: completions are buffered and the
+                    # contiguous prefix is flushed as soon as it is ready, so output
+                    # order matches input and partial progress is still saved on crash.
+                    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-                    _persist_result(result, csv_writer, csv_file, jsonl_file)
-                    completed += 1
-                    _progress(result, completed)
+                    logger.info(f"[{coach.version}] Parallel mode: {workers} workers "
+                                f"(inter-row delay disabled, output kept in input order)")
+                    with ThreadPoolExecutor(max_workers=workers) as executor:
+                        future_to_idx = {
+                            executor.submit(
+                                _compute_row_result, coach, row_id, row,
+                                len(rows), folder_source, dataset_source,
+                                max_retries_no_suggestions,
+                            ): idx
+                            for idx, (row_id, row) in enumerate(rows_to_run)
+                        }
+                        pending: Dict[int, Optional[Dict[str, Any]]] = {}
+                        next_idx = 0
+                        for future in as_completed(future_to_idx):
+                            pending[future_to_idx[future]] = future.result()
+                            # Flush every contiguous-from-next_idx result, in order.
+                            while next_idx in pending:
+                                result = pending.pop(next_idx)
+                                next_idx += 1
+                                if result is None:
+                                    continue
+                                _persist_result(result, csv_writer, csv_file, jsonl_file)
+                                completed += 1
+                                _progress(result, completed)
+                else:
+                    # Sequential mode: keep the rate-limit delays between rows.
+                    for idx, (row_id, row) in enumerate(rows_to_run):
+                        result = _compute_row_result(
+                            coach, row_id, row, len(rows), folder_source, dataset_source,
+                            max_retries_no_suggestions,
+                        )
+                        if result is None:
+                            continue
 
-                    if idx == 0:  # First row just completed
-                        print("  Warming up connections for 5s...")
-                        time.sleep(5)
+                        _persist_result(result, csv_writer, csv_file, jsonl_file)
+                        completed += 1
+                        _progress(result, completed)
 
-                    # Delay between rows to avoid HTTP 429 rate limit errors
-                    if idx < total - 1:
-                        print(f"  Waiting {ROW_DELAY_SECONDS}s before next row...")
-                        time.sleep(ROW_DELAY_SECONDS)
+                        if idx == 0:  # First row just completed
+                            logger.info("  Warming up connections for 5s...")
+                            time.sleep(5)
 
-        finally:
-            csv_file.close()
-            jsonl_file.close()
+                        # Delay between rows to avoid HTTP 429 rate limit errors
+                        if idx < total - 1:
+                            logger.info(f"  Waiting {ROW_DELAY_SECONDS}s before next row...")
+                            time.sleep(ROW_DELAY_SECONDS)
+
+            finally:
+                pbar.close()
+                csv_file.close()
+                jsonl_file.close()
 
     # Build summary from the full JSONL file (includes all previous runs)
     all_results = []
@@ -472,28 +615,28 @@ def process_csv(
                 except json.JSONDecodeError:
                     pass
 
-    print("\n" + "=" * 80)
-    print("BATCH SUMMARY")
-    print("=" * 80)
-    print(f"Total processed: {len(all_results)}")
-
-    print("\nRouting breakdown:")
+    summary_lines = ["=" * 80, "BATCH SUMMARY", "=" * 80, f"Total processed: {len(all_results)}"]
+    summary_lines.append("Routing breakdown:")
     for route, count in Counter(r['route'] for r in all_results).most_common():
-        print(f"  {route:20} {count:3} queries")
-
-    print("\nIntent breakdown:")
+        summary_lines.append(f"  {route:20} {count:3} queries")
+    summary_lines.append("Intent breakdown:")
     for intent, count in Counter(r['intent'] for r in all_results).most_common():
-        print(f"  {intent:20} {count:3} queries")
-
-    print(f"\nOutputs saved:")
-    print(f"  Summary : {results_csv}")
-    print(f"  Details : {details_jsonl}")
+        summary_lines.append(f"  {intent:20} {count:3} queries")
+    summary_lines.append("Outputs saved:")
+    summary_lines.append(f"  Summary : {results_csv}")
+    summary_lines.append(f"  Details : {details_jsonl}")
 
     for _log_file in ["llm_outputs.txt", "llm_prompts.txt"]:
         _log_path = Path(_log_file)
         if _log_path.exists():
             _log_path.unlink()
-            print(f"  Deleted : {_log_file}")
+            summary_lines.append(f"  Deleted : {_log_file}")
+
+    # Always show the final summary on screen, regardless of verbosity.
+    summary = "\n".join(summary_lines)
+    logger.info(summary)
+    if not verbose:
+        print("\n" + summary)
 
 
 if __name__ == "__main__":
@@ -531,6 +674,16 @@ if __name__ == "__main__":
     parser.add_argument('--workers', type=int, default=1,
                         help='Number of concurrent queries (default: 1 = sequential with '
                              'inter-row delays). >1 enables a thread pool with no delays.')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='Also stream INFO logs to the console. By default only errors '
+                             'show on screen and a progress bar tracks completion; all logs '
+                             'are written to the log file regardless.')
+    parser.add_argument('--log-file', default=DEFAULT_LOG_FILE, dest='log_file',
+                        help=f'Path to the log file capturing all logs (default: {DEFAULT_LOG_FILE})')
+    parser.add_argument('--max-retries-no-suggestions', type=int, default=0,
+                        dest='max_retries_no_suggestions',
+                        help='Re-run a query up to N times when WC returns no suggestions '
+                             '(likely a misclassification). 0 disables retries (default: 0).')
 
     args = parser.parse_args()
 
@@ -544,4 +697,7 @@ if __name__ == "__main__":
         details_jsonl_override=args.details_jsonl,
         wc_app_src=args.wc_app_src,
         workers=args.workers,
+        verbose=args.verbose,
+        log_file=args.log_file,
+        max_retries_no_suggestions=args.max_retries_no_suggestions,
     )

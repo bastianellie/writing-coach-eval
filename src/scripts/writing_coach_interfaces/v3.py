@@ -1,9 +1,27 @@
 from __future__ import annotations
 
+import logging
+import re
 from typing import Any, Dict
 
 from src.scripts.writing_coach_interfaces.base import WritingCoachInterface
 from src.scripts.writing_coach_interfaces.utils import install_invoke_llm_shim
+
+logger = logging.getLogger(__name__)
+
+
+# Mirror the production blueprint's HTML sniff so we pick the same builder
+# (ManuscriptManager.from_html vs. the markdown constructor).
+_HTML_TAG_RE = re.compile(
+    r"</?(?:p|div|span|h[1-6]|ul|ol|li|table|thead|tbody|tr|td|th|"
+    r"blockquote|pre|code|br|hr|strong|em|b|i|a|section|article|figure)"
+    r"(?:\s|/?>)",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_html(text: str) -> bool:
+    return bool(_HTML_TAG_RE.search(text or ""))
 
 
 class WritingCoachV3Interface(WritingCoachInterface):
@@ -12,6 +30,10 @@ class WritingCoachV3Interface(WritingCoachInterface):
     def __init__(self) -> None:
         self._preset_config: Dict[str, Any] = {}
         self._graph = None
+        # Lazily-loaded (ManuscriptManager, get_wc_summarizer); None until first
+        # use, then either the real symbols or (None, None) if the running WC
+        # app doesn't ship the writing_coach positioner package.
+        self._manuscript_deps: tuple | None = None
         self._initialize()
 
     @property
@@ -105,6 +127,59 @@ class WritingCoachV3Interface(WritingCoachInterface):
         self._initialize_writing_coach_v3_only()
         builder = get_preset("writing_coach_v3")
         self._graph = builder.build_without_checkpointing()
+        # Resolve the optional positioner deps once on the main thread so the
+        # import (and any "not available" warning) happens deterministically
+        # before parallel per-row processing starts.
+        self._load_manuscript_deps()
+
+    def _load_manuscript_deps(self) -> tuple:
+        """Import the optional ``writing_coach`` positioner deps once.
+
+        Returns ``(ManuscriptManager, get_wc_summarizer)``, or ``(None, None)``
+        when the running WC app doesn't ship the ``writing_coach`` package
+        (e.g. the baseline app without the hierarchical positioner). Cached so
+        we don't retry the import — or re-log the warning — on every row.
+        """
+        if self._manuscript_deps is None:
+            try:
+                from src.writing_coach.llm_summarizer import get_wc_summarizer
+                from src.writing_coach.manuscript import ManuscriptManager
+
+                self._manuscript_deps = (ManuscriptManager, get_wc_summarizer)
+            except ImportError as exc:
+                logger.warning(
+                    "writing_coach positioner module not available (%s); using "
+                    "the legacy segment-analysis path (manuscript=None). This is "
+                    "expected when running against the baseline app.",
+                    exc,
+                )
+                self._manuscript_deps = (None, None)
+        return self._manuscript_deps
+
+    def _build_manuscript(self, document_text: str):
+        """Build a ManuscriptManager so segment_analysis takes the positioner
+        path (not the legacy anchor path). Without this, the trained
+        hierarchical positioner never runs — segment_analysis_node falls back to
+        `_legacy_segment_analysis` whenever `state['manuscript']` is None, so
+        placement would ignore the positioner entirely. Mirrors the production
+        blueprint: summarizer uses the preset's `segment_analysis` model.
+
+        Returns ``None`` when the running WC app lacks the ``writing_coach``
+        package (baseline app), which keeps segment_analysis on its legacy path.
+        """
+        manuscript_cls, get_wc_summarizer = self._load_manuscript_deps()
+        if manuscript_cls is None:
+            return None
+
+        summarizer_model = self._preset_config.get("models", {}).get("segment_analysis")
+        summarizer = (
+            get_wc_summarizer("writing_coach_v3", summarizer_model)
+            if summarizer_model
+            else None
+        )
+        if _looks_like_html(document_text):
+            return manuscript_cls.from_html(document_text, summarizer=summarizer)
+        return manuscript_cls(document_text, summarizer=summarizer)
 
     def run_query(self, row_id: int, query: str, document_text: str) -> Dict[str, Any]:
         from src.state_definitions import WritingCoachV2State
@@ -123,6 +198,7 @@ class WritingCoachV3Interface(WritingCoachInterface):
             "model_config": self._preset_config.get("models", {}),
             "prompt_versions": self._preset_config.get("prompts", {}),
             "parameters": self._preset_config.get("parameters", {}),
+            "manuscript": self._build_manuscript(document_text),
             "suggestions": [],
             "references": [],
             "research_papers": [],
